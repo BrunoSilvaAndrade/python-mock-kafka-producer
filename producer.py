@@ -2,6 +2,7 @@ from pyconfigparser import configparser
 from multiprocessing import Process
 from kafka import KafkaProducer
 from os.path import isfile
+from faker import Faker
 import datetime
 import logging
 import argparse
@@ -22,6 +23,7 @@ DEFAULT_WORKER_GLOBALS = {
     '__builtins__': globals()['__builtins__'],
     'datetime': datetime,
     'random': random,
+    'fake': Faker(),
     'time': time,
     'sys': sys,
     'os': os,
@@ -44,8 +46,9 @@ def produce(worker_id, producer_config, tmplt: str, position: int, end: int):
     last_second = current_time_milli()
 
     while position < end:
-        value = eval(tmplt, {**DEFAULT_WORKER_GLOBALS, 'position': position})
-        producer.send(topic, json.dumps(value).encode('utf-8'))
+        worker_globals = {**DEFAULT_WORKER_GLOBALS, 'position': position}
+        value = eval(tmplt, worker_globals)
+        producer.send(topic, json.dumps(value).encode('utf-8'), f'Wroker-{worker_id} Position-{position}'.encode('utf-8'))
         position += 1
 
         if (current_time_milli() - last_second) >= 1000:
@@ -63,7 +66,7 @@ def main():
     log.setLevel(logging.INFO)
 
     parser = argparse.ArgumentParser(description='Producer')
-    parser.add_argument('--template', '-t', type=str, default='template.py', help='The template to be produced')
+    parser.add_argument('--template', '-t', type=str, default='template', help='The template to be produced')
     parser.add_argument('--env', '-e', type=str, required=True, help='Environment where you wanna produce')
     parser.add_argument('--count', '-c', type=int, default=1, help='Number of events you wanna produce')
     parser.add_argument('--workers', '-w', type=int, default=1, help='Number of parallel workers')
@@ -82,7 +85,7 @@ def main():
 
     if not isfile(args.template):
         log.error(
-            'Create a default template.py file or create a template file and pass it using --template/-t argument')
+            'Create a default template file or create a template file and pass it using --template/-t argument')
         exit(1)
 
     kafka_config = config[args.env]
