@@ -2,10 +2,14 @@ from pyconfigparser import configparser
 from multiprocessing import Process
 from kafka import KafkaProducer
 from os.path import isfile
+import datetime
 import logging
 import argparse
+import random
 import json
 import time
+import sys
+import os
 
 CONFIG_SCHEMA = {
     str: {
@@ -14,13 +18,22 @@ CONFIG_SCHEMA = {
     }
 }
 
+DEFAULT_WORKER_GLOBALS = {
+    '__builtins__': globals()['__builtins__'],
+    'datetime': datetime,
+    'random': random,
+    'time': time,
+    'sys': sys,
+    'os': os,
+}
+
 
 def current_time_milli():
     return round(time.time() * 1000)
 
 
-def produce(_id, producer_config, tmplt: str, position: int, end: int):
-    log = logging.getLogger(f'Worker-{_id}')
+def produce(worker_id, producer_config, tmplt: str, position: int, end: int):
+    log = logging.getLogger(f'Worker-{worker_id}')
     log.setLevel(logging.INFO)
 
     producer = KafkaProducer(bootstrap_servers=producer_config.bootstrap_servers)
@@ -31,7 +44,7 @@ def produce(_id, producer_config, tmplt: str, position: int, end: int):
     last_second = current_time_milli()
 
     while position < end:
-        value = eval(tmplt, {**globals(), 'position': position})
+        value = eval(tmplt, {**DEFAULT_WORKER_GLOBALS, 'position': position})
         producer.send(topic, json.dumps(value).encode('utf-8'))
         position += 1
 
