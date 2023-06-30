@@ -2,11 +2,11 @@ from pyconfigparser import configparser
 from multiprocessing import Process
 from kafka import KafkaProducer
 from os.path import isfile
+from random import Random
 from faker import Faker
 import datetime
 import logging
 import argparse
-import random
 import json
 import time
 import sys
@@ -22,7 +22,7 @@ CONFIG_SCHEMA = {
 DEFAULT_WORKER_GLOBALS = {
     '__builtins__': globals()['__builtins__'],
     'datetime': datetime,
-    'random': random,
+    'random': Random(),
     'fake': Faker(),
     'time': time,
     'sys': sys,
