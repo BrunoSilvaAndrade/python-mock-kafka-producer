@@ -5,6 +5,7 @@ from kafka import KafkaProducer
 from schema import Optional
 from os.path import isfile
 from random import Random
+from typing import List
 from faker import Faker
 import datetime
 import logging
@@ -37,7 +38,7 @@ def current_time_milli():
     return round(time.time() * 1000)
 
 
-def sync(futures: list[Future]):
+def sync(futures: List[Future]):
     for f in futures:
         if not f.is_done:
             f.get()
