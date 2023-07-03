@@ -1,6 +1,8 @@
 from pyconfigparser import configparser
 from multiprocessing import Process
+from kafka.future import Future
 from kafka import KafkaProducer
+from schema import Optional
 from os.path import isfile
 from random import Random
 from faker import Faker
@@ -15,7 +17,8 @@ import os
 CONFIG_SCHEMA = {
     str: {
         'bootstrap_servers': str,
-        'topic': str
+        'topic': str,
+        Optional('queue_size', default=5000): int
     }
 }
 
@@ -34,7 +37,14 @@ def current_time_milli():
     return round(time.time() * 1000)
 
 
+def sync(futures: list[Future]):
+    for f in futures:
+        if not f.is_done:
+            f.get()
+
+
 def produce(worker_id, producer_config, tmplt: str, position: int, end: int):
+    futures = []
     log = logging.getLogger(f'Worker-{worker_id}')
     log.setLevel(logging.INFO)
 
@@ -47,9 +57,17 @@ def produce(worker_id, producer_config, tmplt: str, position: int, end: int):
 
     while position < end:
         worker_globals = {**DEFAULT_WORKER_GLOBALS, 'position': position}
-        value = eval(tmplt, worker_globals)
-        producer.send(topic, json.dumps(value).encode('utf-8'), f'Wroker-{worker_id} Position-{position}'.encode('utf-8'))
+        key = f'Worker-{worker_id} Position-{position}'.encode('utf-8')
+        value = json.dumps(eval(tmplt, worker_globals)).encode('utf-8')
+        future = producer.send(topic, value, key)
+        future.add_errback(lambda e: log.error('error while sending the message of position %d - Error msg: %s', position, str(e)))
+        futures.append(future)
         position += 1
+
+        if len(futures) == producer_config.queue_size:
+            log.info('flushing %s future events', producer_config.queue_size)
+            sync(futures)
+            futures = []
 
         if (current_time_milli() - last_second) >= 1000:
             delta = position - last_count
@@ -57,6 +75,7 @@ def produce(worker_id, producer_config, tmplt: str, position: int, end: int):
             last_second = current_time_milli()
             log.info("start:%d - end:%d - count:%d - delta:%d/s", start, end, position, delta)
 
+    sync(futures)
     log.info('%s events produced', end - start)
 
 
