@@ -1,3 +1,4 @@
 python-config-parser==3.1.1
 kafka-python==2.0.2
+glom==23.3.0
 Faker==18.11.2
