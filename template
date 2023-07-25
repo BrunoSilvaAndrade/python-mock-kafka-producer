@@ -1,0 +1,14 @@
+#The default template globals are:
+#random = Random()
+#fake = Faker()
+#__builtins__
+#datetime
+#time
+#sys
+#os
+
+{
+    'name': 'bruno',
+    'age': 27,
+    'profession': 'Bug creator'
+}
