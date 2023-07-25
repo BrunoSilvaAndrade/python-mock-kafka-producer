@@ -18,7 +18,7 @@ import os
 
 CONFIG_SCHEMA = {
     str: {
-        'bootstrap_servers': str,
+        'kafka': {'bootstrap_servers': str},
         'topic': str,
         Optional('queue_size', default=5000): int
     }
@@ -37,6 +37,45 @@ DEFAULT_WORKER_GLOBALS = {
 logging.basicConfig(format='[%(asctime)s][%(levelname)s][%(name)s] - %(message)s')
 LOG = logging.getLogger(__name__)
 LOG.setLevel(logging.INFO)
+
+
+class CheckersHolder:
+    def __init__(self):
+        self.validations = []
+
+    def add(self, is_invalid, callback):
+        tup = is_invalid, callback
+        self.validations.append(tup)
+
+    def is_valid(self):
+        for is_invalid, callback in self.validations:
+            if is_invalid:
+                callback()
+                return False
+
+        return True
+
+
+def setup_config_or_exit(config, args):
+    checker = CheckersHolder()
+    checker.add(args.env not in config.keys(),
+                lambda: LOG.error("'%s' is not present in the config - Available envs: %s", args.env, config.keys()))
+
+    checker.add(args.count < args.workers,
+                lambda: LOG.error('The number of events cannot be smaller than the number of workers'))
+
+    checker.add(not isfile(args.template),
+                lambda: LOG.error("Create template named as 'template' or pass it using --template/-t <file name>"))
+
+    if checker.is_valid():
+        config = config[args.env]
+
+        if args.topic is not None:
+            config.topic = args.topic
+
+        return config
+
+    exit(1)
 
 
 def get_assignments(assigns: str):
@@ -72,7 +111,7 @@ def produce(worker_id, producer_config, tmplt: str, assigns: list, position: int
     log = logging.getLogger(f'Worker-{worker_id}')
     log.setLevel(logging.INFO)
 
-    producer = KafkaProducer(bootstrap_servers=producer_config.bootstrap_servers)
+    producer = KafkaProducer(**producer_config.kafka)
     topic = producer_config.topic
 
     start = position
@@ -81,7 +120,7 @@ def produce(worker_id, producer_config, tmplt: str, assigns: list, position: int
 
     while position < end:
         worker_globals = {**DEFAULT_WORKER_GLOBALS, 'position': position}
-        key = f'Worker-{worker_id} Position-{position}'.encode('utf-8')
+        key = f'position-{position}'.encode('utf-8')
 
         tmplt = eval(tmplt, worker_globals)
         if assigns:
@@ -114,8 +153,9 @@ def produce(worker_id, producer_config, tmplt: str, assigns: list, position: int
 
 def main():
     parser = argparse.ArgumentParser(description='Producer')
-    parser.add_argument('--template', '-t', type=str, default='template', help='The template to be produced')
     parser.add_argument('--env', '-e', type=str, required=True, help='Environment where you wanna produce')
+    parser.add_argument('--template', type=str, default='template', help='The template to be produced')
+    parser.add_argument('--topic', type=str, help='A topic that will replace the config`s default topic')
     parser.add_argument('--count', '-c', type=int, default=1, help='Number of events you wanna produce')
     parser.add_argument('--workers', '-w', type=int, default=1, help='Number of parallel workers')
     parser.add_argument('--start', '-s', type=int, default=1, help='The start offset of the event position')
@@ -124,36 +164,21 @@ def main():
                             Like: --assign=a.b='U' to replace {a:{b:'A' to 'U'}}")
 
     args, _ = parser.parse_known_args()
-
     config = configparser.get_config(CONFIG_SCHEMA, config_dir='')
-
-    if args.env not in config.keys():
-        LOG.error("'%s' is not present in the config - Available environments: %s", args.env, config.keys())
-        exit(1)
-
-    if args.count < args.workers:
-        LOG.error('The number of events cannot be smaller than the number of workers')
-        exit(1)
-
-    if not isfile(args.template):
-        LOG.error(
-            'Create a default template file or create a template file and pass it using --template/-t argument')
-        exit(1)
-
-    kafka_config = config[args.env]
+    config = setup_config_or_exit(config, args)
 
     assigns = get_assignments(args.assign)
 
     workers = args.workers
     count = round(args.count / workers)
 
-    LOG.info('Producing %s on env %s', args.count, args.env)
+    LOG.info('producing %s env[%s] topic[%s]', args.count, args.env, config.topic)
     with open(args.template) as template:
         template = template.read()
         start = args.start
 
         for worker_id in range(1, workers + 1):
-            worker_args = (worker_id, kafka_config, template, assigns, start, start + count)
+            worker_args = (worker_id, config, template, assigns, start, start + count)
             Process(target=produce, args=worker_args).start()
             start = start + count
 
