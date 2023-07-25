@@ -1,3 +1,4 @@
 local:
-  bootstrap_servers: localhost:9093
+  kafka:
+    bootstrap_servers: localhost:9093
   topic: topic_name_example
