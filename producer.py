@@ -1,12 +1,10 @@
 from pyconfigparser import configparser
 from multiprocessing import Process
-from kafka.future import Future
 from kafka import KafkaProducer
 from glom import glom, Assign
 from schema import Optional
 from os.path import isfile
 from random import Random
-from typing import List
 from faker import Faker
 import datetime
 import logging
@@ -39,6 +37,41 @@ LOG = logging.getLogger(__name__)
 LOG.setLevel(logging.INFO)
 
 
+class ProducerFlusherWrapper:
+    def __init__(self, producer, queue_size):
+        self.producer = producer
+        self.queue_size = queue_size
+        self.futures = []
+
+    def produce(self, topic, value=None, key=None):
+        future = self.producer.send(topic, value, key)
+        self.futures.append(future)
+
+        if len(self.futures) == self.queue_size:
+            LOG.info('flushing %s future events', self.queue_size)
+            self.flush()
+        return future
+
+    def flush(self):
+        for f in self.futures:
+            if not f.is_done:
+                f.get()
+        self.futures = []
+
+
+class ProducerWatcher:
+    def __init__(self):
+        self.last_count = 0
+        self.last_capture = current_time_milli()
+
+    def callback_if_after_a_second(self, next_count, callback):
+        if (current_time_milli() - self.last_capture) >= 1000:
+            delta = next_count - self.last_count
+            self.last_count = next_count
+            self.last_capture = current_time_milli()
+            callback(delta)
+
+
 class CheckersHolder:
     def __init__(self):
         self.validations = []
@@ -56,26 +89,12 @@ class CheckersHolder:
         return True
 
 
-def setup_config_or_exit(config, args):
-    checker = CheckersHolder()
-    checker.add(args.env not in config.keys(),
-                lambda: LOG.error("'%s' is not present in the config - Available envs: %s", args.env, config.keys()))
+def dump_as_json_utf8_encoded(o):
+    return json.dumps(o).encode('utf-8')
 
-    checker.add(args.count < args.workers,
-                lambda: LOG.error('The number of events cannot be smaller than the number of workers'))
 
-    checker.add(not isfile(args.template),
-                lambda: LOG.error("Create template named as 'template' or pass it using --template/-t <file name>"))
-
-    if checker.is_valid():
-        config = config[args.env]
-
-        if args.topic is not None:
-            config.topic = args.topic
-
-        return config
-
-    exit(1)
+def current_time_milli():
+    return round(time.time() * 1000)
 
 
 def get_assignments(assigns: str):
@@ -96,65 +115,143 @@ def get_assignments(assigns: str):
     return list(map(get_ass, assigns))
 
 
-def current_time_milli():
-    return round(time.time() * 1000)
+def apply_assignments(value, assigns):
+    if assigns:
+        for p, v in assigns:
+            value = glom(value, Assign(p, v))
+
+    return value
 
 
-def sync(futures: List[Future]):
-    for f in futures:
-        if not f.is_done:
-            f.get()
+def template_producer(args, config, assigns):
+    workers = args.workers
+    count = round(args.count / workers)
+
+    with open(args.template) as template:
+        template = template.read()
+        start = args.start
+
+        for worker_id in range(1, workers + 1):
+            worker_args = (worker_id, config, template, assigns, start, start + count)
+            Process(target=_template_producer, args=worker_args).start()
+            start = start + count
 
 
-def produce(worker_id, producer_config, tmplt: str, assigns: list, position: int, end: int):
-    futures = []
+def _template_producer(worker_id, producer_config, template: str, assigns: list, position: int, end: int):
     log = logging.getLogger(f'Worker-{worker_id}')
     log.setLevel(logging.INFO)
 
-    producer = KafkaProducer(**producer_config.kafka)
+    producer = ProducerFlusherWrapper(KafkaProducer(**producer_config.kafka), producer_config.queue_size)
     topic = producer_config.topic
+    watcher = ProducerWatcher()
 
     start = position
-    last_count = position
-    last_second = current_time_milli()
 
     while position < end:
         worker_globals = {**DEFAULT_WORKER_GLOBALS, 'position': position}
         key = f'position-{position}'.encode('utf-8')
 
-        tmplt = eval(tmplt, worker_globals)
-        if assigns:
-            for path, value in assigns:
-                tmplt = glom(tmplt, Assign(path, value))
-        tmplt = json.dumps(tmplt).encode('utf-8')
+        value = eval(template, worker_globals)
+        value = apply_assignments(value, assigns)
+        value = dump_as_json_utf8_encoded(value)
 
-        future = producer.send(topic, tmplt, key)
-        futures.append(future)
+        future = producer.produce(topic, value, key)
         future.add_errback(
             lambda e: log.error('error while sending the message of position %d - Error msg: %s', position, str(e))
         )
 
         position += 1
 
-        if len(futures) == producer_config.queue_size:
-            log.info('flushing %s future events', producer_config.queue_size)
-            sync(futures)
-            futures = []
+        watcher.callback_if_after_a_second(position,
+                                           lambda delta: log.info("start:%d - end:%d - count:%d - delta:%d/s", start, end, position, delta))
 
-        if (current_time_milli() - last_second) >= 1000:
-            delta = position - last_count
-            last_count = position
-            last_second = current_time_milli()
-            log.info("start:%d - end:%d - count:%d - delta:%d/s", start, end, position, delta)
-
-    sync(futures)
+    producer.flush()
     log.info('%s events produced', end - start)
+
+
+def make_json_source_key(value, args, count):
+    if not args.json_source_key_path:
+        return str(count).encode('utf-8')
+
+    key = []
+    for path in args.json_source_key_path.split(','):
+        path = path.strip()
+        data = glom(value, path)
+
+        if type(data) is list or type(data) is dict:
+            key.append(json.dumps(data))
+        else:
+            key.append(str(data))
+
+    return '-'.join(key).encode('utf-8')
+
+
+def json_source_producer(args, producer_config, assigns):
+    log = logging.getLogger('Json Source Producer')
+    producer = ProducerFlusherWrapper(KafkaProducer(**producer_config.kafka), producer_config.queue_size)
+    topic = producer_config.topic
+    watcher = ProducerWatcher()
+
+    with open(args.json_source) as fp:
+        position = 0
+        for line in fp:
+            value = json.loads(line)
+            value = apply_assignments(value, assigns)
+            key = make_json_source_key(value, args, position)
+            value = dump_as_json_utf8_encoded(value)
+
+            future = producer.produce(topic, value, key)
+            future.add_errback(
+                lambda e: log.error('error while sending the message of position %d - Error msg: %s', position, str(e))
+            )
+
+            position += 1
+
+            watcher.callback_if_after_a_second(position,
+                                               lambda delta: log.info("count: %d, delta:%s/s", position, delta))
+
+        producer.flush()
+
+
+def setup_config_or_exit(config, args):
+    checker = CheckersHolder()
+    checker.add(args.env not in config.keys(),
+                lambda: LOG.error("'%s' is not present in the config - Available envs: %s", args.env, config.keys()))
+
+    checker.add(args.count < args.workers,
+                lambda: LOG.error('The number of events cannot be smaller than the number of workers'))
+
+    checker.add(args.json_source and args.template,
+                lambda: LOG.error("You cannot use json-source with template"))
+
+    checker.add(not args.json_source and not args.template,
+                lambda: LOG.error("You need to chose a template or provide a json source, check the helper"))
+
+    checker.add(args.template and not isfile(args.template),
+                lambda: LOG.error("Template file [%s] not found", args.template))
+
+    checker.add(args.json_source and not isfile(args.json_source),
+                lambda: LOG.error("Json source file [%s] not found", args.json_source))
+
+    if checker.is_valid():
+        config = config[args.env]
+
+        if args.topic is not None:
+            config.topic = args.topic
+
+        return config
+
+    exit(1)
 
 
 def main():
     parser = argparse.ArgumentParser(description='Producer')
     parser.add_argument('--env', '-e', type=str, required=True, help='Environment where you wanna produce')
-    parser.add_argument('--template', type=str, default='template', help='The template to be produced')
+    parser.add_argument('--template', '-t', type=str, help='The template to be produced')
+    parser.add_argument('--json-source', '-j', type=str, help='A file containing an JSON object per line')
+    parser.add_argument('--json-source-key-path', type=str, help='The json path for the key\n \
+                            Like: {id:{serial: 1, position:0}, some_value:1} -> id.serial to access serial value\n \
+                            you can combine multiple paths like: a.b,a.b.c they will be dash joined')
     parser.add_argument('--topic', type=str, help='A topic that will replace the config`s default topic')
     parser.add_argument('--count', '-c', type=int, default=1, help='Number of events you wanna produce')
     parser.add_argument('--workers', '-w', type=int, default=1, help='Number of parallel workers')
@@ -169,18 +266,11 @@ def main():
 
     assigns = get_assignments(args.assign)
 
-    workers = args.workers
-    count = round(args.count / workers)
+    if args.template:
+        template_producer(args, config, assigns)
 
-    LOG.info('producing %s env[%s] topic[%s]', args.count, args.env, config.topic)
-    with open(args.template) as template:
-        template = template.read()
-        start = args.start
-
-        for worker_id in range(1, workers + 1):
-            worker_args = (worker_id, config, template, assigns, start, start + count)
-            Process(target=produce, args=worker_args).start()
-            start = start + count
+    elif args.json_source:
+        json_source_producer(args, config, assigns)
 
 
 if __name__ == '__main__':
