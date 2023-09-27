@@ -80,13 +80,11 @@ class CheckersHolder:
         tup = is_invalid, callback
         self.validations.append(tup)
 
-    def is_valid(self):
+    def exit_if_fail(self):
         for is_invalid, callback in self.validations:
             if is_invalid:
                 callback()
-                return False
-
-        return True
+                exit(1)
 
 
 def dump_as_json_utf8_encoded(o):
@@ -125,7 +123,8 @@ def apply_assignments(value, assigns):
 
 def template_producer(args, config, assigns):
     workers = args.workers
-    count = round(args.count / workers)
+    count = 1 if args.count is None else args.count
+    count = round(count / workers)
 
     with open(args.template) as template:
         template = template.read()
@@ -192,9 +191,9 @@ def json_source_producer(args, producer_config, assigns):
     topic = producer_config.topic
     watcher = ProducerWatcher()
 
-    with open(args.json_source) as fp:
+    with open(args.json_source) as source:
         position = 0
-        for line in fp:
+        for line in source:
             value = json.loads(line)
             value = apply_assignments(value, assigns)
             key = make_json_source_key(value, args, position)
@@ -210,15 +209,39 @@ def json_source_producer(args, producer_config, assigns):
             watcher.callback_if_after_a_second(position,
                                                lambda delta: log.info("count: %d, delta:%s/s", position, delta))
 
+            if args.count is not None and args.count <= position:
+                break
+
         producer.flush()
 
 
-def setup_config_or_exit(config, args):
+def main():
+    parser = argparse.ArgumentParser(description='Producer')
+    parser.add_argument('--env', '-e', type=str, required=True, help='Environment where you wanna produce')
+    parser.add_argument('--template', '-t', type=str, help='The template to be produced')
+    parser.add_argument('--json-source', '-j', type=str, help='A file containing an JSON object per line')
+    parser.add_argument('--json-source-key-path', type=str, help='The json path for the key\n \
+                            Like: {id:{serial: 1, position:0}, some_value:1} -> id.serial to access serial value\n \
+                            you can combine multiple paths like: a.b,a.b.c they will be dash joined')
+    parser.add_argument('--topic', type=str, help='A topic that will replace the config`s default topic')
+    parser.add_argument('--count', '-c', type=int, help='Number of events you wanna produce')
+    parser.add_argument('--workers', '-w', type=int, default=1, help='Number of parallel workers')
+    parser.add_argument('--start', '-s', type=int, default=1, help='The start offset of the event position')
+    parser.add_argument('--assign', type=str, help="You can assign values to your\
+                            template using python glom query language\n \
+                            Like: --assign=a.b='U' to replace {a:{b:'A' to 'U'}}")
+
+    args, _ = parser.parse_known_args()
+    config = configparser.get_config(CONFIG_SCHEMA, config_dir='')
     checker = CheckersHolder()
+
     checker.add(args.env not in config.keys(),
                 lambda: LOG.error("'%s' is not present in the config - Available envs: %s", args.env, config.keys()))
 
-    checker.add(args.count < args.workers,
+    checker.add(args.count is not None and args.count < 1,
+                lambda: LOG.error("The count number must be a positive number bigger than 0"))
+
+    checker.add(args.count is not None and args.count < args.workers,
                 lambda: LOG.error('The number of events cannot be smaller than the number of workers'))
 
     checker.add(args.json_source and args.template,
@@ -233,36 +256,11 @@ def setup_config_or_exit(config, args):
     checker.add(args.json_source and not isfile(args.json_source),
                 lambda: LOG.error("Json source file [%s] not found", args.json_source))
 
-    if checker.is_valid():
-        config = config[args.env]
+    checker.exit_if_fail()
+    config = config[args.env]
 
-        if args.topic is not None:
-            config.topic = args.topic
-
-        return config
-
-    exit(1)
-
-
-def main():
-    parser = argparse.ArgumentParser(description='Producer')
-    parser.add_argument('--env', '-e', type=str, required=True, help='Environment where you wanna produce')
-    parser.add_argument('--template', '-t', type=str, help='The template to be produced')
-    parser.add_argument('--json-source', '-j', type=str, help='A file containing an JSON object per line')
-    parser.add_argument('--json-source-key-path', type=str, help='The json path for the key\n \
-                            Like: {id:{serial: 1, position:0}, some_value:1} -> id.serial to access serial value\n \
-                            you can combine multiple paths like: a.b,a.b.c they will be dash joined')
-    parser.add_argument('--topic', type=str, help='A topic that will replace the config`s default topic')
-    parser.add_argument('--count', '-c', type=int, default=1, help='Number of events you wanna produce')
-    parser.add_argument('--workers', '-w', type=int, default=1, help='Number of parallel workers')
-    parser.add_argument('--start', '-s', type=int, default=1, help='The start offset of the event position')
-    parser.add_argument('--assign', type=str, help="You can assign values to your\
-                            template using python glom query language\n \
-                            Like: --assign=a.b='U' to replace {a:{b:'A' to 'U'}}")
-
-    args, _ = parser.parse_known_args()
-    config = configparser.get_config(CONFIG_SCHEMA, config_dir='')
-    config = setup_config_or_exit(config, args)
+    if args.topic is not None:
+        config.topic = args.topic
 
     assigns = get_assignments(args.assign)
 
