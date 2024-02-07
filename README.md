@@ -5,17 +5,20 @@ How to use
 #FIRSTLY CREATE A VIRTUAL ENV AFTER CLONING THE PROJECT INSIDE THE PROJECT`s ROOT FOLDER
 #THEN EXECUTE
 source venv/bin/activate
-pip install -r requirements.txt
-python producer.py --help
-
-usage: producer.py [-h] --env ENV [--template TEMPLATE] [--topic TOPIC] [--count COUNT] [--workers WORKERS] [--start START] [--assign ASSIGN]
+usage: producer.py [-h] --env ENV [--template TEMPLATE] [--json-source JSON_SOURCE] [--json-source-key-path JSON_SOURCE_KEY_PATH] [--topic TOPIC] [--count COUNT] [--workers WORKERS] [--start START]
+                   [--assign ASSIGN]
 
 Producer
 
 options:
   -h, --help            show this help message and exit
   --env ENV, -e ENV     Environment where you wanna produce
-  --template TEMPLATE   The template to be produced
+  --template TEMPLATE, -t TEMPLATE
+                        The template to be produced
+  --json-source JSON_SOURCE, -j JSON_SOURCE
+                        A file containing an JSON object per line
+  --json-source-key-path JSON_SOURCE_KEY_PATH
+                        The json path for the key Like: {id:{serial: 1, position:0}, some_value:1} -> id.serial to access serial value you can combine multiple paths like: a.b,a.b.c they will be dash joined
   --topic TOPIC         A topic that will replace the config`s default topic
   --count COUNT, -c COUNT
                         Number of events you wanna produce
